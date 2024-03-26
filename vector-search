@@ -1,0 +1,183 @@
+#Este es un script para generar un VectorSearch en GCloud sobre una máquina virtual
+#Considera lo siguiente. Un buscador de vectores debe generar ID unicas tanto para las sentences como para los embeddings. Por lo mismo, cualquier modificación a este código debe contemplar eso. 
+
+from google.cloud import storage
+from vertexai.language_models import TextEmbeddingModel
+from google.cloud import aiplatform
+import PyPDF2
+import re
+import os
+import json
+import uuid
+from google.oauth2 import service_account
+
+# Configuración inicial y autenticación
+key_path = os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/usuarioVM/clavecuentadeservicio-1234567.json"
+
+#Si vas a trabajar en una máquina local, es tan facil como cambiar esta linea de codigo con el path local donde tienes el .json para la cuenta de servicio
+#Recuerda autorizar las funciones necesarias de tu cuenta de servicio en el apartado de IAM de Gcloud
+
+credentials = service_account.Credentials.from_service_account_file(
+    key_path,
+    scopes=['https://www.googleapis.com/auth/cloud-platform']
+)
+storage_client = storage.Client()
+
+# Configuración del proyecto, ubicación y bucket
+project = "Nombre_del_Proyecto" #ESTA NO ES LA ID NUMERICA, SIRVE COPIAR EL NOMBRE DEL PROYECTO DEL SHELL DE GCLOUD
+location = "us-central1" #Reemplaza la ubicación de tu proyecto
+bucket_name = "Nombre_de_tu_bucket" #Es importante que el bucket esté en la misma región de trabajo que el proyecto
+index_name = "RAG_indice" #Este es el nombre que vas a colocarle al RAG index que vamos a crear
+
+aiplatform.init(project=project, location=location)
+
+# Funciones definidas para el procesamiento
+def list_pdfs_in_bucket(bucket_name):
+    storage_client = storage.Client()
+    blobs = storage_client.list_blobs(bucket_name)
+    return [blob.name for blob in blobs if blob.name.endswith('.pdf')]
+
+def download_pdf_from_bucket(bucket_name, source_blob_name, destination_file_name):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(source_blob_name)
+    blob.download_to_filename(destination_file_name)
+
+def extract_sentences_from_pdf(pdf_path):
+    with open(pdf_path, 'rb') as file:
+        reader = PyPDF2.PdfReader(file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + " " if page.extract_text() else ""
+    return [sentence.strip() for sentence in re.split(r'\.\s+', text) if sentence.strip()]
+
+def save_sentences_to_bucket(sentences, bucket_name, base_file_name):
+    if not os.path.exists('temp'):
+        os.makedirs('temp')
+    for i, sentence in enumerate(sentences):
+        sentence_file_path = os.path.join('temp', f"{base_file_name}_sentence_{i}.json")
+        with open(sentence_file_path, 'w') as sentence_file:
+            json.dump({"sentence": sentence}, sentence_file)
+        upload_file(bucket_name, f"sentence/{base_file_name}_sentence_{i}.json", sentence_file_path)
+        os.remove(sentence_file_path)
+    
+def generate_text_embeddings(sentences) -> list:
+    aiplatform.init(project=project, location=location)
+    model = TextEmbeddingModel.from_pretrained("textembedding-gecko@003")
+
+    all_embeddings = []
+    max_tokens_per_batch = 20000  # Establece un límite seguro para el total de tokens por lote
+    max_instances_per_batch = 250  # Límite de instancias por lote
+
+    i = 0
+    while i < len(sentences):
+        current_batch = []
+        current_tokens = 0
+        current_instances = 0
+
+        # Verifica ambos límites: el número de tokens y el número de instancias
+        while (i < len(sentences) and current_tokens + len(sentences[i].split()) <= max_tokens_per_batch and current_instances < max_instances_per_batch):
+            current_tokens += len(sentences[i].split())
+            current_batch.append(sentences[i])
+            i += 1
+            current_instances += 1
+
+        if current_batch:
+            embeddings = model.get_embeddings(current_batch)
+            vectors = [embedding.values for embedding in embeddings]
+            all_embeddings.extend(vectors)
+        else:
+            # Manejo del caso en que una sola oración excede el límite de tokens o instancias
+            print(f"Advertencia: Una oración excede los límites establecidos. Oración omitida.")
+            i += 1  # Omite esta oración y continúa con la siguiente
+
+    return all_embeddings
+
+def generate_and_save_embeddings(pdf_path, bucket_name, pdf_file):
+    sentences = extract_sentences_from_pdf(pdf_path)
+    embeddings = generate_text_embeddings(sentences)
+    base_file_name = os.path.basename(pdf_file).replace('.pdf', '')
+    
+    # Asegurarse de que la carpeta 'temp' exista
+    if not os.path.exists('temp'):
+        os.makedirs('temp')
+    
+    # Para cada oración y su embedding correspondiente, generar un ID y guardarlos
+    for i, (sentence, embedding) in enumerate(zip(sentences, embeddings)):
+        id = str(uuid.uuid4())
+        sentence_file_path = os.path.join('temp', f"{base_file_name}_sentence_{i}.json")
+        embed_file_path = os.path.join('temp', f"{base_file_name}_embedding_{i}.json")
+        
+        # Guardar la oración con su ID
+        with open(sentence_file_path, 'w') as sentence_file:
+            json.dump({"id": id, "sentence": sentence}, sentence_file)
+        upload_file(bucket_name, f"sentence/{os.path.basename(sentence_file_path)}", sentence_file_path)
+        
+        # Guardar el embedding con el mismo ID
+        with open(embed_file_path, 'w') as embed_file:
+            json.dump({"id": id, "embedding": embedding}, embed_file)
+        upload_file(bucket_name, f"embeddings/{os.path.basename(embed_file_path)}", embed_file_path)
+        
+        # Opcionalmente, eliminar los archivos locales si ya no son necesarios
+        os.remove(sentence_file_path)
+        os.remove(embed_file_path)
+
+
+def upload_file(bucket_name, blob_name, file_path):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(file_path)
+
+def verify_json_files(directory_path):
+    """Verifica la validez de los archivos JSON en el directorio especificado."""
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".json"):
+            filepath = os.path.join(directory_path, filename)
+            with open(filepath, 'r') as file:
+                try:
+                    for line in file:
+                        json.loads(line)  # Verifica la validez del JSON
+                except json.JSONDecodeError as e:
+                    print(f"Error de formato en el archivo {filename}: {e}")
+        else:
+                print(f"{filename} es válido")  # Imprime un mensaje si el archivo es válido
+
+def process_all_pdfs_in_bucket(bucket_name):
+    pdf_files = list_pdfs_in_bucket(bucket_name)
+    for pdf_file in pdf_files:
+        temp_pdf_path = f"temp_{os.path.basename(pdf_file)}"
+        download_pdf_from_bucket(bucket_name, pdf_file, temp_pdf_path)
+        generate_and_save_embeddings(temp_pdf_path, bucket_name, pdf_file)
+        os.remove(temp_pdf_path)
+
+def create_vector_index(bucket_name, index_name):
+    # Antes de crear el índice, verifica la validez de los archivos JSON en la carpeta 'temp'
+    print("Verificando archivos JSON...")
+    verify_json_files("temp/")
+
+    # Intenta crear el índice vectorial solo si los archivos JSON son válidos
+    print("Creando índice vectorial...")
+    RAG_indice = aiplatform.MatchingEngineIndex.create_tree_ah_index(
+        display_name=index_name,
+        contents_delta_uri=f"gs://{bucket_name}/embeddings",
+        dimensions=768,
+        approximate_neighbors_count=10,
+        project=project,
+        location=location,
+    )
+    RAG_indice_endpoint = aiplatform.MatchingEngineIndexEndpoint.create(
+        display_name=index_name,
+        project=project,
+        location=location,
+        public_endpoint_enabled=True,
+    )
+    RAG_indice_endpoint.deploy_index(
+        index=RAG_indice,
+        deployed_index_id=index_name,
+    )
+
+# Ejecutar el proceso completo
+if __name__ == "__main__":
+    process_all_pdfs_in_bucket(bucket_name)
+    create_vector_index(bucket_name, index_name)
